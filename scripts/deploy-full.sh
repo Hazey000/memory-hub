@@ -402,15 +402,29 @@ deploy_models() {
         fi
     done
 
+    # Scale down CPU models before deploying GPU variants (shared PVC)
+    if [ "$GPU_MODELS" = true ]; then
+        for dep_ns in "all-minilm-l6-v2:$EMBEDDING_MODEL_NAMESPACE" \
+                      "ms-marco-minilm-l12-v2:$RERANKER_MODEL_NAMESPACE"; do
+            local dep="${dep_ns%%:*}" ns="${dep_ns##*:}"
+            if oc get deployment --context "$CONTEXT" "$dep" -n "$ns" &>/dev/null; then
+                info "Scaling down CPU model $dep to release PVC..."
+                oc scale deployment --context "$CONTEXT" "$dep" -n "$ns" --replicas=0
+            fi
+        done
+    fi
+
     info "Deploying embedding model..."
     oc apply --context "$CONTEXT" -k "$embedding_dir"
 
     info "Deploying reranker model..."
     oc apply --context "$CONTEXT" -k "$reranker_dir"
 
+    local embedding_deploy reranker_deploy
+    embedding_deploy=$(grep '^  name:' "$embedding_dir/deployment.yaml" | head -1 | awk '{print $2}')
+    reranker_deploy=$(grep '^  name:' "$reranker_dir/deployment.yaml" | head -1 | awk '{print $2}')
+
     info "Waiting for embedding model rollout (model download may take 2-3 min)..."
-    local embedding_deploy
-    embedding_deploy=$(oc get deploy --context "$CONTEXT" -n "$EMBEDDING_MODEL_NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$embedding_deploy" ]; then
         if ! oc rollout status --context "$CONTEXT" "deployment/$embedding_deploy" \
                 -n "$EMBEDDING_MODEL_NAMESPACE" --timeout=300s; then
@@ -419,8 +433,6 @@ deploy_models() {
     fi
 
     info "Waiting for reranker model rollout..."
-    local reranker_deploy
-    reranker_deploy=$(oc get deploy --context "$CONTEXT" -n "$RERANKER_MODEL_NAMESPACE" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
     if [ -n "$reranker_deploy" ]; then
         if ! oc rollout status --context "$CONTEXT" "deployment/$reranker_deploy" \
                 -n "$RERANKER_MODEL_NAMESPACE" --timeout=300s; then
@@ -505,10 +517,69 @@ deploy_auth() {
     fi
 
     info "Seeding OAuth clients..."
+    # Ensure users-configmap.yaml exists (normally generated during MCP deploy,
+    # but auth runs first and needs it for seed-clients.json).
+    local users_cm="$REPO_ROOT/memory-hub-mcp/deploy/users-configmap.yaml"
+    if [ ! -f "$users_cm" ]; then
+        local users_example="$REPO_ROOT/memory-hub-mcp/deploy/users-configmap.example.yaml"
+        if [ -f "$users_example" ]; then
+            info "Generating users-configmap.yaml from template..."
+            export CURRENT_USER="${USER:-$(whoami)}"
+            "$REPO_ROOT/.venv/bin/python" -c "
+import os, re, secrets, pathlib
+src = pathlib.Path('$users_example').read_text()
+user = os.environ.get('CURRENT_USER', 'admin')
+out = src.replace('CURRENT_USER_DISPLAY', user.replace('-', ' ').title())
+out = out.replace('CURRENT_USER', user)
+out = re.sub(
+    r'REPLACE-ME-GENERATE-WITH-openssl-rand-hex-16',
+    lambda m: 'mh-dev-' + secrets.token_hex(8),
+    out,
+)
+pathlib.Path('$users_cm').write_text(out)
+print(f'  Generated for user \"{user}\"')
+"
+        fi
+    fi
+    # Auto-generate seed-clients.json from the users ConfigMap if it doesn't exist.
+    local seed_json="$REPO_ROOT/scripts/seed-clients.json"
+    if [ ! -f "$seed_json" ]; then
+        if [ -f "$users_cm" ]; then
+            info "Generating $seed_json from users ConfigMap..."
+            "$REPO_ROOT/.venv/bin/python" -c "
+import json, sys, yaml, pathlib
+with open(sys.argv[1]) as f:
+    cm = yaml.safe_load(f)
+users = json.loads(cm['data']['users.json'])['users']
+clients = []
+for u in users:
+    identity_type = u.get('identity_type', 'user')
+    scopes = ['memory:read', 'memory:write:user']
+    if 'organizational' in u.get('scopes', []):
+        scopes.append('memory:write:organizational')
+    if 'enterprise' in u.get('scopes', []):
+        scopes.append('memory:write:enterprise')
+    clients.append({
+        'client_id': u['user_id'],
+        'client_secret': u['api_key'],
+        'client_name': u.get('name', u['user_id']),
+        'identity_type': identity_type,
+        'tenant_id': u.get('tenant_id', 'default'),
+        'default_scopes': scopes,
+    })
+pathlib.Path(sys.argv[2]).write_text(json.dumps(clients, indent=2))
+print(f'  Generated {len(clients)} OAuth clients from users ConfigMap.')
+" "$users_cm" "$seed_json"
+        fi
+    fi
     "$REPO_ROOT/scripts/run-seed-oauth-clients.sh"
 
     info "Building and deploying Auth server (project: $AUTH_PROJECT)..."
     pushd "$REPO_ROOT/memoryhub-auth" > /dev/null
+    if [ ! -d .venv ] || ! .venv/bin/alembic --version &>/dev/null; then
+        info "Creating memoryhub-auth .venv..."
+        make install 2>&1 | tail -1
+    fi
     make deploy PROJECT="$AUTH_PROJECT"
     popd > /dev/null
 
@@ -634,12 +705,6 @@ deploy_tile() {
 # Section 7b: Configure local client (API key for CLI/SDK)
 # ---------------------------------------------------------------------------
 configure_local_client() {
-    local api_key_file="$HOME/.config/memoryhub/api-key"
-    if [ -f "$api_key_file" ]; then
-        info "API key already exists at $api_key_file"
-        return 0
-    fi
-
     local users_cm="$REPO_ROOT/memory-hub-mcp/deploy/users-configmap.yaml"
     if [ ! -f "$users_cm" ]; then return 0; fi
 
@@ -652,19 +717,32 @@ users = json.loads(cm['data']['users.json'])
 print(users['users'][0]['api_key'])
 " "$users_cm" 2>/dev/null || echo "")
 
-    if [ -n "$key" ] && [[ "$key" != REPLACE-ME* ]]; then
-        user_id=$("$REPO_ROOT/.venv/bin/python" -c "
+    if [ -z "$key" ] || [[ "$key" == REPLACE-ME* ]]; then return 0; fi
+
+    user_id=$("$REPO_ROOT/.venv/bin/python" -c "
 import json, sys, yaml
 with open(sys.argv[1]) as f:
     cm = yaml.safe_load(f)
 users = json.loads(cm['data']['users.json'])
 print(users['users'][0]['user_id'])
 " "$users_cm" 2>/dev/null || echo "unknown")
-        mkdir -p "$HOME/.config/memoryhub"
-        echo -n "$key" > "$api_key_file"
-        chmod 600 "$api_key_file"
-        info "Wrote API key to $api_key_file (user: $user_id)"
+
+    local mcp_route mcp_url=""
+    mcp_route=$(oc get route --context "$CONTEXT" memory-hub-mcp -n "$MCP_PROJECT" \
+        -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    if [ -n "$mcp_route" ]; then
+        mcp_url="https://${mcp_route}/mcp/"
     fi
+
+    "$REPO_ROOT/.venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/memoryhub-cli/src')
+from memoryhub_cli.config import migrate_flat_to_credentials, write_credentials_section
+migrate_flat_to_credentials()
+write_credentials_section(sys.argv[1], sys.argv[2], sys.argv[3] or None)
+" "$CONTEXT" "$key" "$mcp_url"
+
+    info "Wrote credentials for context '$CONTEXT' (user: $user_id)"
 }
 
 # ---------------------------------------------------------------------------
@@ -687,13 +765,18 @@ smoke_test() {
     fi
     local mcp_url="https://${mcp_route}/mcp/"
 
-    local api_key_file="$HOME/.config/memoryhub/api-key"
-    if [ ! -f "$api_key_file" ]; then
-        warn "No API key at $api_key_file -- skipping smoke test"
-        return 0
-    fi
     local api_key
-    api_key=$(cat "$api_key_file")
+    api_key=$("$REPO_ROOT/.venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/memoryhub-cli/src')
+from memoryhub_cli.config import get_api_key
+k = get_api_key()
+if k: print(k, end='')
+else: sys.exit(1)
+" 2>/dev/null) || {
+        warn "No API key found -- skipping smoke test"
+        return 0
+    }
 
     if ! command -v memoryhub &>/dev/null; then
         warn "memoryhub CLI not installed -- skipping smoke test"
@@ -789,7 +872,7 @@ print_summary() {
     if [ -n "$mcp_route" ]; then
         printf "    %-24s %s\n" "MCP endpoint (agents):" "https://${mcp_route}/mcp/"
     fi
-    printf "    %-24s %s\n" "Dev API key:" "~/.config/memoryhub/api-key"
+    printf "    %-24s %s\n" "Credentials:" "~/.config/memoryhub/credentials [$CONTEXT]"
 }
 
 # ---------------------------------------------------------------------------
