@@ -2306,5 +2306,293 @@ def thread_delete(
         console.print(f"  Cascade mode: {result.cascade_mode}")  # noqa: T201
 
 
+@app.command()
+def doctor(
+    output: OutputFormat = typer.Option(
+        OutputFormat.table, "--output", "-o", help="Output format: table, json, quiet",
+    ),
+):
+    """Check MemoryHub personal edition health: DB, model, migrations."""
+    import sqlite3
+
+    checks: dict[str, str | int | bool | None] = {}
+
+    # Edition detection
+    try:
+        import memoryhub_local  # noqa: F401
+        checks["edition"] = "personal"
+    except ImportError:
+        checks["edition"] = "cluster"
+        if output == OutputFormat.json:
+            json_success(checks)
+        else:
+            console.print("Edition: [cyan]cluster[/cyan] (memoryhub-local not installed)")  # noqa: T201
+            console.print("[dim]Doctor diagnostics are for the personal edition.[/dim]")  # noqa: T201
+        return
+
+    from memoryhub_local.database import get_default_db_path
+    from memoryhub_local.embeddings.base import EMBEDDING_DIM
+    from memoryhub_local.embeddings.onnx import (
+        MODEL_DIR_NAME,
+        get_default_model_dir,
+        is_model_downloaded,
+    )
+
+    # Database
+    db_path = get_default_db_path()
+    checks["db_path"] = str(db_path)
+    checks["db_exists"] = db_path.exists()
+    if db_path.exists():
+        checks["db_size_bytes"] = db_path.stat().st_size
+        try:
+            conn = sqlite3.connect(str(db_path))
+            journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            checks["wal_mode"] = journal == "wal"
+            try:
+                version_row = conn.execute(
+                    "SELECT version_num FROM local_alembic_version LIMIT 1"
+                ).fetchone()
+                checks["alembic_version"] = version_row[0] if version_row else None
+            except sqlite3.OperationalError:
+                checks["alembic_version"] = "pre-alembic"
+            node_count = conn.execute(
+                "SELECT COUNT(*) FROM memory_nodes WHERE deleted_at IS NULL"
+            ).fetchone()[0]
+            checks["memory_count"] = node_count
+            conn.close()
+        except Exception as exc:
+            checks["db_error"] = str(exc)
+    else:
+        checks["db_size_bytes"] = 0
+
+    # Model
+    model_dir = get_default_model_dir()
+    checks["model_dir"] = str(model_dir)
+    checks["model_downloaded"] = is_model_downloaded(model_dir)
+    checks["model_name"] = MODEL_DIR_NAME
+    checks["embedding_dim"] = EMBEDDING_DIM
+
+    if output == OutputFormat.json:
+        json_success(checks)
+        return
+    if output == OutputFormat.quiet:
+        return
+
+    # Render table output
+    console.print("[bold]MemoryHub Doctor[/bold]\n")  # noqa: T201
+
+    edition_color = "green" if checks["edition"] == "personal" else "cyan"
+    console.print(f"  Edition:    [{edition_color}]{checks['edition']}[/{edition_color}]")  # noqa: T201
+
+    if checks.get("db_exists"):
+        size = checks.get("db_size_bytes", 0)
+        if size < 1024:
+            size_str = f"{size} B"
+        elif size < 1024 * 1024:
+            size_str = f"{size / 1024:.1f} KB"
+        else:
+            size_str = f"{size / (1024 * 1024):.1f} MB"
+        console.print(f"  Database:   [green]{checks['db_path']}[/green] ({size_str})")  # noqa: T201
+        wal = "[green]yes[/green]" if checks.get("wal_mode") else "[red]no[/red]"
+        console.print(f"  WAL mode:   {wal}")  # noqa: T201
+        alembic_v = checks.get("alembic_version", "none")
+        console.print(f"  Migration:  {alembic_v}")  # noqa: T201
+        console.print(f"  Memories:   {checks.get('memory_count', 0)}")  # noqa: T201
+    else:
+        console.print(f"  Database:   [yellow]not found[/yellow] ({checks['db_path']})")  # noqa: T201
+        console.print("  [dim]Run 'memoryhub mcp' to create it.[/dim]")  # noqa: T201
+
+    if checks.get("model_downloaded"):
+        console.print(f"  Model:      [green]{checks['model_name']}[/green]")  # noqa: T201
+    else:
+        console.print(f"  Model:      [yellow]not downloaded[/yellow] ({checks['model_name']})")  # noqa: T201
+        console.print("  [dim]Model downloads automatically on first 'memoryhub mcp' start.[/dim]")  # noqa: T201
+
+    console.print(f"  Embed dim:  {checks['embedding_dim']}")  # noqa: T201
+
+    if checks.get("db_error"):
+        console.print(f"\n  [red]DB error: {checks['db_error']}[/red]")  # noqa: T201
+
+
+@app.command()
+def dream(
+    model: str = typer.Option(
+        ..., "--model", "-m",
+        help="LLM model name (e.g., llama3.2, gemini-2.0-flash)",
+    ),
+    url: str = typer.Option(
+        "http://localhost:11434/v1",
+        "--url",
+        help="OpenAI-compatible API base URL (default: Ollama)",
+    ),
+    api_key: str = typer.Option(
+        None, "--api-key", "-k",
+        help="API key for the LLM endpoint (optional for Ollama)",
+    ),
+    thread_id: str = typer.Option(
+        None, "--thread", "-t",
+        help="Extract a specific thread by UUID (default: all pending)",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Show pending threads without extracting",
+    ),
+    output: OutputFormat = typer.Option(
+        OutputFormat.table, "--output", "-o",
+        help="Output format: table, json, quiet",
+    ),
+):
+    """Extract facts from conversation threads using a local LLM.
+
+    Runs the extraction pipeline against threads with unprocessed
+    messages, using an OpenAI-compatible LLM endpoint. Designed for
+    use with Ollama but works with any compatible endpoint.
+
+    Examples:
+
+        memoryhub dream --model llama3.2
+
+        memoryhub dream --model gemini-2.0-flash \\
+            --url https://generativelanguage.googleapis.com/v1beta/openai \\
+            --api-key $GEMINI_API_KEY
+
+        memoryhub dream --model llama3.2 --thread <uuid>
+    """
+    try:
+        import memoryhub_local  # noqa: F401
+    except ImportError:
+        err_console.print(
+            "[red]memoryhub-local is not installed.[/red]\n"
+            "Install with: pip install 'memoryhub[local]'"
+        )
+        raise typer.Exit(1)
+
+    asyncio.run(_run_dream(model, url, api_key, thread_id, dry_run, output))
+
+
+async def _run_dream(model, url, api_key, thread_id, dry_run, output):
+    import logging
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    from memoryhub_local.services.extraction import (
+        extract_from_thread,
+        get_pending_threads,
+        make_http_llm_fn,
+    )
+    from memoryhub_local.startup import initialize_backend
+
+    state = await initialize_backend(quiet=True)
+
+    if dry_run:
+        async with state.session_factory() as session:
+            pending = await get_pending_threads(session)
+        if output == OutputFormat.json:
+            json_success({"pending": pending})
+            return
+        if not pending:
+            console.print("[dim]No threads with pending extraction.[/dim]")
+            return
+        table = Table(title="Pending Threads")
+        table.add_column("Thread ID", style="cyan")
+        table.add_column("Title")
+        table.add_column("Pending", justify="right")
+        for t in pending:
+            table.add_row(t["id"][:12] + "...", t.get("title") or "-", str(t["pending_count"]))
+        console.print(table)
+        return
+
+    llm_fn = make_http_llm_fn(model, url, api_key)
+
+    threads_to_process = []
+    if thread_id:
+        threads_to_process = [{"id": thread_id, "title": None}]
+    else:
+        async with state.session_factory() as session:
+            threads_to_process = await get_pending_threads(session)
+
+    if not threads_to_process:
+        if output == OutputFormat.json:
+            json_success({"message": "no pending threads", "threads_processed": 0})
+        else:
+            console.print("[dim]No threads with pending extraction.[/dim]")
+        return
+
+    if output != OutputFormat.json:
+        console.print(
+            f"Extracting from {len(threads_to_process)} thread(s) "
+            f"using [cyan]{model}[/cyan] at {url}"
+        )
+
+    results = []
+    total_extracted = 0
+    total_failures = 0
+
+    for t_info in threads_to_process:
+        tid = t_info["id"]
+        title = t_info.get("title") or "untitled"
+        try:
+            async with state.session_factory() as session:
+                r = await extract_from_thread(
+                    session,
+                    tid,
+                    llm_fn=llm_fn,
+                    embedding_service=state.embedding_service,
+                    recall_backend=state.recall_backend,
+                    extraction_model=model,
+                )
+                total_extracted += r.get("extracted_count", 0)
+                total_failures += r.get("failures", 0)
+                results.append({"thread_id": tid, "title": title, **r})
+                if output != OutputFormat.json:
+                    count = r.get("extracted_count", 0)
+                    console.print(f"  {tid[:12]}... ({title}): {count} memories extracted")
+        except Exception as exc:
+            total_failures += 1
+            results.append({"thread_id": tid, "title": title, "error": str(exc)})
+            if output != OutputFormat.json:
+                err_console.print(f"  [red]{tid[:12]}... ({title}): {exc}[/red]")
+
+    if output == OutputFormat.json:
+        json_success({
+            "threads_processed": len(results),
+            "total_extracted": total_extracted,
+            "total_failures": total_failures,
+            "results": results,
+        })
+    elif output != OutputFormat.quiet:
+        console.print(
+            f"\n[bold]Done.[/bold] {total_extracted} memories extracted, "
+            f"{total_failures} failures across {len(results)} thread(s)."
+        )
+
+
+@app.command()
+def mcp():
+    """Start a local MCP server (personal edition).
+
+    Launches a stdio MCP server backed by SQLite at
+    ~/.local/share/memoryhub/memoryhub.db. No API key or cluster
+    connection required.
+
+    Install with: pip install "memoryhub[local]"
+    Register with Claude Code: claude mcp add memoryhub -- memoryhub mcp
+    """
+    try:
+        from memoryhub_local.server import run_server
+    except ImportError:
+        err_console.print(
+            "[red]memoryhub-local is not installed.[/red]\n"
+            "Install with: pip install 'memoryhub[local]'"
+        )
+        raise typer.Exit(1)
+
+    asyncio.run(run_server())
+
+
 if __name__ == "__main__":
     app()
