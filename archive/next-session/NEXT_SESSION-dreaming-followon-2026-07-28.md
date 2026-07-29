@@ -13,7 +13,7 @@ actually contribute to search results. The dreaming pipeline shipped and
 benchmarked (84.9% AMB PersonaMem); this epic hardens it and unlocks the
 value of extracted facts in retrieval.
 
-### Phase 1: Test + harden (#429, #430)
+### Phase 1: Test + harden (#429, #430) -- DONE
 
 Unit tests for `_run_dreaming_ingest` and extraction model identity in
 the preflight manifest. The dreaming code path has zero unit coverage
@@ -37,7 +37,7 @@ fast on deprecated model names.
 
 **Parallel-ok:** Yes -- independent of Phase 2.
 
-### Phase 2: Retrieval-unit routing (#447)
+### Phase 2: Retrieval-unit routing (#447) -- DONE (+3.1pp validated)
 
 Extracted dreaming facts don't contribute to search results when pooled
 with full conversation transcripts (source ablation showed +0.1pp without
@@ -101,10 +101,31 @@ including fallback triggering.
 - #370 Ablation Matrix B (backlog, unblocked by #349 closure)
 - Retrieval polish issues (#306, #389, #397, #404, #453, #454) -- future `NEXT_SESSION-retrieval-polish.md`
 
-## What landed last session
+## What landed last session (2026-07-28)
 
-(No sessions yet for this epic. Prior work tracked in
-`archive/next-session/NEXT_SESSION-dreaming-2026-07-20.md`.)
+Phase 1 + Phase 2 code complete. PR #470 targeting main.
+
+**Phase 1 (test + harden):**
+- Bootstrapped pytest infrastructure for amb-harness (dev deps, conftest,
+  asyncio_mode=auto)
+- 16 unit tests for `_run_dreaming_ingest` covering all 7 bug-prone paths
+- Extraction model preflight probe (Gemini + custom endpoint verification)
+- 11 preflight tests
+- Closes #429, #430
+
+**Phase 2 (retrieval-unit routing):**
+- Design doc fleshed out at `planning/retrieval-unit-routing.md`
+- Split routing: two searches (transcripts + facts), round-robin merge
+- Token budget: `MEMORYHUB_MAX_CONTEXT_TOKENS` for small-model deployments
+- All env vars optional, backward compatible
+- 12 routing tests (split, merge, budget, backward compat, integration)
+- Benchmark validated on memoryhub-install-gold cluster:
+  pooled 72.3% vs split 75.4% (+3.1pp, exceeds +2pp target)
+- Closed #455 (Stage 3 LLM fallback already implemented in extraction.py)
+
+39 tests total, zero network calls.
+
+Prior work tracked in `archive/next-session/NEXT_SESSION-dreaming-2026-07-20.md`.
 
 ## Watch out for
 
