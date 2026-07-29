@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memoryhub_core.config import AppSettings
 from memoryhub_core.models.contradiction import ContradictionReport
-from memoryhub_core.models.memory import MemoryNode
+from memoryhub_core.models.memory import MemoryNode, MemoryRelationship
 from memoryhub_core.models.schemas import (
     MemoryNodeCreate,
     MemoryNodeRead,
@@ -173,6 +173,7 @@ async def create_memory(
 
     node = MemoryNode(
         id=memory_id,
+        logical_id=memory_id,
         content=db_content,
         stub=stub,
         scope=data.scope,
@@ -573,6 +574,7 @@ async def update_memory(
 
     new_node = MemoryNode(
         id=new_id,
+        logical_id=old_node.logical_id or old_node.id,
         content=db_content,
         stub=stub,
         scope=old_node.scope,
@@ -602,6 +604,24 @@ async def update_memory(
     old_node.expires_at = now + timedelta(days=app_settings.version_retention_days)
 
     session.add(new_node)
+
+    # Re-point active graph edges from old version to new version (#472).
+    await session.execute(
+        update(MemoryRelationship)
+        .where(
+            MemoryRelationship.source_id == old_node.id,
+            MemoryRelationship.valid_until.is_(None),
+        )
+        .values(source_id=new_id)
+    )
+    await session.execute(
+        update(MemoryRelationship)
+        .where(
+            MemoryRelationship.target_id == old_node.id,
+            MemoryRelationship.valid_until.is_(None),
+        )
+        .values(target_id=new_id)
+    )
 
     # Deep-copy one level of child branches from old node to new node.
     # Chunk branches are skipped when content changed (they reflect old
@@ -2219,6 +2239,7 @@ def node_to_read(
 
     return MemoryNodeRead(
         id=node.id,
+        logical_id=getattr(node, "logical_id", None),
         parent_id=node.parent_id,
         content=node.content,
         stub=node.stub,
