@@ -30,7 +30,8 @@ class TestListProjectMembershipValidation:
         [
             pytest.param("user", True, id="user-isolation-on"),
             pytest.param("user", False, id="user-isolation-off"),
-            pytest.param("service", True, id="service-identity"),
+            pytest.param("service", True, id="service-isolation-on"),
+            pytest.param("service", False, id="service-isolation-off"),
         ],
     )
     async def test_list_project_non_member_is_rejected(
@@ -187,7 +188,8 @@ class TestSearchProjectMembershipValidation:
         [
             pytest.param("user", True, id="user-isolation-on"),
             pytest.param("user", False, id="user-isolation-off"),
-            pytest.param("service", True, id="service-identity"),
+            pytest.param("service", True, id="service-isolation-on"),
+            pytest.param("service", False, id="service-isolation-off"),
         ],
     )
     async def test_non_member_explicit_project_is_rejected(
